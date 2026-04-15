@@ -43,6 +43,7 @@ PACKAGE_EXCLUDES=(
     ".gitignore"
     "LICENSE"
     "*.md"
+    ".DS_Store"
 )
 
 # Colors for output
