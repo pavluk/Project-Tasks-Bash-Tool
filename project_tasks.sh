@@ -402,9 +402,9 @@ replace_version() {
         # Replace __DEPLOY_VERSION__
         replace="${replace//__DEPLOY_VERSION__/$deploy_version}"
 
-        # Handle JSON files
+        # In JSON manifests, update only the first/top-level version field.
         if [[ "$file" == *.json ]]; then
-            replace=$(echo "$replace" | sed -E "s/\"version\": \"[^\"]*\"/\"version\": \"$version\"/g")
+            replace=$(printf '%s' "$replace" | perl -0pe 's/"version"\s*:\s*"[^"]*"/"version": "'"$version"'"/')
         fi
 
         if [[ "$original" != "$replace" ]]; then
