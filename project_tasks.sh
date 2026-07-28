@@ -306,6 +306,7 @@ should_exclude() {
     local file="$1"
     local excludes=("${@:2}")
     local base_name
+    local path_match
     base_name=$(basename "$file")
     # shellcheck disable=SC2053
     for pattern in "${excludes[@]}"; do
@@ -313,7 +314,11 @@ should_exclude() {
             [[ "$file" == $pattern ]] && return 0
             [[ "$base_name" == $pattern ]] && return 0
         else
-            [[ "$file" == *"$pattern"* ]] && return 0
+            path_match="$file"
+            [[ "$path_match" != */ ]] && path_match="$path_match/"
+            [[ "$path_match" == "$pattern/"* ]] && return 0
+            [[ "$path_match" == */"$pattern/"* ]] && return 0
+            [[ "$base_name" == "$pattern" ]] && return 0
         fi
     done
     return 1
