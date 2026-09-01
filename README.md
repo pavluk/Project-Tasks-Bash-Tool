@@ -17,9 +17,10 @@ Supported actions:
 ## Requirements
 
 - `bash`
+- `perl`
 - `zip`
 - `npm` (only if `PROJECT_NPM` is used)
-- PhpStorm copyright templates in `.idea/copyright` (required for `prepareDev`)
+- PhpStorm copyright templates in `.idea/copyright` (optional for `prepareDev`)
 
 ## Action Details
 
@@ -27,7 +28,7 @@ Supported actions:
 - `prepareRelease` - optionally runs npm scripts (if configured), then updates release version/date placeholders in project files.
 - `packageRelease` - creates a release ZIP package in `.packages`.
 - `resetSince` - resets `@since` tags to `__DEPLOY_VERSION__`.
-- `prepareDev` - updates files to dev version/date and updates PhpStorm copyright templates from `.idea/copyright` (required).
+- `prepareDev` - updates files to dev version/date and, when present, updates PhpStorm copyright templates from `.idea/copyright`.
 - `normalizeLangFileNames` - renames language files like `en-GB.name.ini` to `name.ini`.
 - `packageDev` - creates a dev ZIP package in `.packages`.
 
@@ -73,6 +74,15 @@ If `PROJECT_NPM` is set:
 - all scripts are run sequentially;
 - on success: `Run npm scripts ... OK (N scripts)`;
 - on failure: `Run npm scripts ... ERROR`, plus failed script name and log file path.
+
+## File Processing and Packaging
+
+The common exclusion list is shared by replacements and package creation. Packaging
+adds `build` to that list, so generated build sources can be processed before release
+but are not included in the ZIP archive.
+
+For JSON files, only the root object's `version` property is updated. Nested
+`version` properties, including Joomla asset versions, are left unchanged.
 
 ## PhpStorm External Tool Setup
 

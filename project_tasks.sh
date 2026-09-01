@@ -17,8 +17,8 @@ ENV_FILE=""
 PROJECT_NPM=""
 PROJECT_NPM_DIR="build"
 
-# Exclusion patterns for files
-FILES_EXCLUDES=(
+# Exclusions shared by file processing and package creation
+COMMON_EXCLUDES=(
     ".idea"
     ".git"
     ".packages"
@@ -31,19 +31,9 @@ FILES_EXCLUDES=(
     ".DS_Store"
 )
 
-# Exclusion patterns for packages
-PACKAGE_EXCLUDES=(
-    ".idea"
-    ".git"
-    ".packages"
-    ".build"
-    "node_modules"
-    "vendor"
+# Additional exclusions used only for package creation
+PACKAGE_EXTRA_EXCLUDES=(
     "build"
-    ".gitignore"
-    "LICENSE"
-    "*.md"
-    ".DS_Store"
 )
 
 # Colors for output
@@ -95,9 +85,19 @@ normalize_env_path() {
     echo "$value"
 }
 
+trim_whitespace() {
+    local value="$1"
+
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
 # Load environment variables from explicitly provided --env file
 load_env() {
     local env_path=""
+    local key
+    local value
 
     if [[ -z "$ENV_FILE" ]]; then
         echo -e "${RED}Error: --env is required and must point to the file you launched${NC}"
@@ -134,15 +134,18 @@ load_env() {
         key="${line%%=*}"
         value="${line#*=}"
 
-        # Remove quotes from value
-        value="${value%\"}"
-        value="${value#\"}"
-        value="${value%\'}"
-        value="${value#\'}"
+        # Trim surrounding whitespace without interpreting quotes or backslashes.
+        key=$(trim_whitespace "$key")
+        value=$(trim_whitespace "$value")
 
-        # Trim whitespace
-        key=$(echo "$key" | xargs 2>/dev/null || echo "$key")
-        value=$(echo "$value" | xargs 2>/dev/null || echo "$value")
+        # Remove one pair of matching wrapping quotes.
+        if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+            value="${value#\"}"
+            value="${value%\"}"
+        elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+            value="${value#\'}"
+            value="${value%\'}"
+        fi
 
         case "$key" in
             PROJECT_NAME|NAME)
@@ -150,7 +153,7 @@ load_env() {
                 ;;
             PROJECT_VERSION|VERSION)
                 VERSION="$value"
-                set_version "$VERSION"
+                [[ -n "$VERSION" ]] && set_version "$VERSION"
                 ;;
             PROJECT_NPM|NPM_SCRIPT)
                 PROJECT_NPM="$value"
@@ -161,19 +164,12 @@ load_env() {
         esac
     done < "$env_path"
 
-    if [[ -z "$NAME" ]]; then
-        echo -e "${RED}Error: PROJECT_NAME or NAME not found in .env${NC}"
-        exit 1
-    fi
-
-    if [[ -z "$VERSION" ]]; then
-        echo -e "${RED}Error: PROJECT_VERSION or VERSION not found in .env${NC}"
-        exit 1
-    fi
 }
 
 # Print usage
 usage() {
+    local exit_code="${1:-1}"
+
     cat << EOF
 Usage: $0 [OPTIONS]
 
@@ -182,7 +178,7 @@ Options:
     --env=PATH             Path to params file (required)
     --name=NAME            Project name (overrides .env)
     --version=VERSION      Version number (overrides .env)
-    --root=PATH            Root directory (overrides .env location)
+    --root=PATH            Project root (defaults to the current working directory)
     -h, --help             Show this help message
 
 Env file format:
@@ -193,10 +189,10 @@ Examples:
     # Specify env file location (required)
     $0 --action=prepareRelease --env=/path/to/project/build.env
 
-    # Override .env values
-    $0 --action=info --name=MyProject --version=1.2.3
+    # Override values read from the required env file
+    $0 --action=info --env=/path/to/project/build.env --name=MyProject --version=1.2.3
 EOF
-    exit 1
+    exit "$exit_code"
 }
 
 # Parse command line arguments
@@ -228,7 +224,7 @@ parse_args() {
                 shift
                 ;;
             -h|--help)
-                usage
+                usage 0
                 ;;
             *)
                 echo "Unknown option: $1"
@@ -259,6 +255,13 @@ parse_args() {
     if [[ -n "$override_root" ]]; then
         ROOT_DIR="$override_root"
     fi
+
+    if [[ ! -d "$ROOT_DIR" ]]; then
+        echo -e "${RED}Error: project root directory not found: $ROOT_DIR${NC}"
+        exit 1
+    fi
+
+    ROOT_DIR=$(cd "$ROOT_DIR" && pwd -P)
 
     return 0
 }
@@ -371,9 +374,151 @@ get_files() {
         if ! should_exclude "$rel_path" "${excludes[@]}"; then
             files+=("$rel_path")
         fi
-    done < <(find "${find_args[@]}" 2>/dev/null)
+    done < <(find "${find_args[@]}")
 
     printf '%s\n' "${files[@]}"
+}
+
+# Apply a text transformation through a same-directory temporary copy.
+# This preserves file metadata and exact trailing newline bytes.
+transform_file() {
+    local filepath="$1"
+    local mode="$2"
+    local temp_file
+
+    FILE_CHANGED=false
+    temp_file=$(mktemp "${filepath}.tmp.XXXXXX")
+
+    if ! cp -p "$filepath" "$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    case "$mode" in
+        version)
+            local target_version="$3"
+            local doc_version="$4"
+            local deploy_version="$5"
+            local is_json="$6"
+
+            if ! TARGET_VERSION="$target_version" DOC_VERSION="$doc_version" DEPLOY_VERSION="$deploy_version" IS_JSON="$is_json" perl -0pi -e '
+                if ($ENV{IS_JSON} ne "1") {
+                    s/\@version([^\S\r\n]*).*/"\@version" . $1 . $ENV{DOC_VERSION}/ge;
+                    s/<version>[^\r\n]*<\/version>/"<version>" . $ENV{TARGET_VERSION} . "<\/version>"/ge;
+                    s/\* ?Version:([^\S\r\n]*).*/"* Version:" . $1 . $ENV{TARGET_VERSION}/ge;
+                    s/__DEPLOY_VERSION__/$ENV{DEPLOY_VERSION}/ge;
+                } else {
+                    # Scan JSON structure and update only a root-object property.
+                    my $depth = 0;
+                    my $i = 0;
+                    my $length = length($_);
+
+                    while ($i < $length) {
+                        my $char = substr($_, $i, 1);
+
+                        if ($char eq q{"}) {
+                            my $start = $i++;
+                            while ($i < $length) {
+                                my $string_char = substr($_, $i, 1);
+                                if ($string_char eq q{\\}) {
+                                    $i += 2;
+                                    next;
+                                }
+                                $i++;
+                                last if $string_char eq q{"};
+                            }
+                            my $end = $i;
+
+                            if ($depth == 1 && substr($_, $start, $end - $start) eq q{"version"}) {
+                                my $colon = $end;
+                                $colon++ while $colon < $length && substr($_, $colon, 1) =~ /\s/;
+
+                                if ($colon < $length && substr($_, $colon, 1) eq q{:}) {
+                                    my $value_start = $colon + 1;
+                                    $value_start++ while $value_start < $length && substr($_, $value_start, 1) =~ /\s/;
+
+                                    if ($value_start < $length && substr($_, $value_start, 1) eq q{"}) {
+                                        my $value_end = $value_start + 1;
+                                        while ($value_end < $length) {
+                                            my $value_char = substr($_, $value_end, 1);
+                                            if ($value_char eq q{\\}) {
+                                                $value_end += 2;
+                                                next;
+                                            }
+                                            $value_end++;
+                                            last if $value_char eq q{"};
+                                        }
+
+                                        substr(
+                                            $_,
+                                            $value_start,
+                                            $value_end - $value_start,
+                                            q{"} . $ENV{TARGET_VERSION} . q{"}
+                                        );
+                                        last;
+                                    }
+                                }
+                            }
+
+                            next;
+                        }
+
+                        if ($char eq "{" || $char eq "[") {
+                            $depth++;
+                        } elsif ($char eq "}" || $char eq "]") {
+                            $depth--;
+                        }
+                        $i++;
+                    }
+                }
+            ' "$temp_file"; then
+                rm -f "$temp_file"
+                return 1
+            fi
+            ;;
+        date)
+            local target_date="$3"
+
+            if ! TARGET_DATE="$target_date" perl -0pi -e '
+                s/\@date([^\S\r\n]*).*/"\@date" . $1 . $ENV{TARGET_DATE}/ge;
+                s/<date>[^\r\n]*<\/date>/"<date>" . $ENV{TARGET_DATE} . "<\/date>"/ge;
+                s/<creationDate>[^\r\n]*<\/creationDate>/"<creationDate>" . $ENV{TARGET_DATE} . "<\/creationDate>"/ge;
+                s/__DEPLOY_DATE__/$ENV{TARGET_DATE}/ge;
+            ' "$temp_file"; then
+                rm -f "$temp_file"
+                return 1
+            fi
+            ;;
+        since)
+            if ! perl -0pi -e 's/\@since([^\S\r\n]*).*/"\@since" . $1 . "__DEPLOY_VERSION__"/ge' "$temp_file"; then
+                rm -f "$temp_file"
+                return 1
+            fi
+            ;;
+        copyright)
+            local target_date="$3"
+
+            if ! TARGET_DATE="$target_date" perl -0pi -e '
+                s/\@version([^\S\r\n]*)[^\r\n]*?&#10;?/"\@version" . $1 . "__DEPLOY_VERSION__&#10;"/ge;
+                s/\@date([^\S\r\n]*)[^\r\n]*?&#10;?/"\@date" . $1 . $ENV{TARGET_DATE} . "&#10;"/ge;
+            ' "$temp_file"; then
+                rm -f "$temp_file"
+                return 1
+            fi
+            ;;
+        *)
+            rm -f "$temp_file"
+            echo "Error: unknown transform mode '$mode'" >&2
+            return 1
+            ;;
+    esac
+
+    if cmp -s "$filepath" "$temp_file"; then
+        rm -f "$temp_file"
+    else
+        mv -f "$temp_file" "$filepath"
+        FILE_CHANGED=true
+    fi
 }
 
 # Replace version in files
@@ -394,29 +539,12 @@ replace_version() {
         [[ ! -f "$filepath" ]] && continue
         LC_ALL=C grep -Iq . "$filepath" || continue
 
-        local original
-        original=$(cat "$filepath")
-        local replace="$original"
+        local is_json=0
+        [[ "$file" == *.json ]] && is_json=1
 
-        # Replace @version
-        replace=$(echo "$replace" | sed -E "s/@version([[:space:]]*).*/@version\1$doc_version/g")
-        # Replace <version>
-        replace=$(echo "$replace" | sed -E "s/<version>.*<\/version>/<version>$version<\/version>/g")
-        # Replace * Version:
-        replace=$(echo "$replace" | sed -E "s/\* ?Version:([[:space:]]*).*/\* Version:\1$version/g")
-        # Replace __DEPLOY_VERSION__
-        replace="${replace//__DEPLOY_VERSION__/$deploy_version}"
-
-        # In JSON manifests, update only the first/top-level version field.
-        if [[ "$file" == *.json ]]; then
-            replace=$(printf '%s' "$replace" | perl -0pe 's/"version"\s*:\s*"[^"]*"/"version": "'"$version"'"/')
-        fi
-
-        if [[ "$original" != "$replace" ]]; then
-            echo "$replace" > "$filepath"
-            ((count++))
-        fi
-    done < <(get_files "$ROOT_DIR" "${FILES_EXCLUDES[@]}")
+        transform_file "$filepath" version "$version" "$doc_version" "$deploy_version" "$is_json"
+        [[ "$FILE_CHANGED" == true ]] && ((count += 1))
+    done < <(get_files "$ROOT_DIR" "${COMMON_EXCLUDES[@]}")
 
     [[ $count -gt 0 ]] && echo -e "${GREEN}OK${NC} ($count files)" || echo -e "${GREEN}OK${NC}"
 }
@@ -431,24 +559,9 @@ replace_date() {
         [[ ! -f "$filepath" ]] && continue
         LC_ALL=C grep -Iq . "$filepath" || continue
 
-        local original
-        original=$(cat "$filepath")
-        local replace="$original"
-
-        # Replace @date
-        replace=$(echo "$replace" | sed -E "s/@date([[:space:]]*).*/@date\1$DATE/g")
-        # Replace <date>
-        replace=$(echo "$replace" | sed -E "s/<date>.*<\/date>/<date>$DATE<\/date>/g")
-        # Replace <creationDate>
-        replace=$(echo "$replace" | sed -E "s/<creationDate>.*<\/creationDate>/<creationDate>$DATE<\/creationDate>/g")
-        # Replace __DEPLOY_DATE__
-        replace="${replace//__DEPLOY_DATE__/$DATE}"
-
-        if [[ "$original" != "$replace" ]]; then
-            echo "$replace" > "$filepath"
-            ((count++))
-        fi
-    done < <(get_files "$ROOT_DIR" "${FILES_EXCLUDES[@]}")
+        transform_file "$filepath" date "$DATE"
+        [[ "$FILE_CHANGED" == true ]] && ((count += 1))
+    done < <(get_files "$ROOT_DIR" "${COMMON_EXCLUDES[@]}")
 
     [[ $count -gt 0 ]] && echo -e "${GREEN}OK${NC} ($count files)" || echo -e "${GREEN}OK${NC}"
 }
@@ -525,40 +638,71 @@ create_package() {
     local package_name="$1"
     local package_dir="$ROOT_DIR/.packages"
     local package_path="$package_dir/$package_name"
+    local source_temp_dir
+    local archive_temp_dir
+    local temp_package_path
+
+    if [[ "$package_name" == */* || "$package_name" == "." || "$package_name" == ".." ]]; then
+        echo -e "${RED}Error: invalid package name: $package_name${NC}"
+        return 1
+    fi
+
+    if ! command -v zip >/dev/null 2>&1; then
+        echo -e "${RED}Error: zip command not found${NC}"
+        return 1
+    fi
 
     mkdir -p "$package_dir"
 
-    # Remove existing package
-    [[ -f "$package_path" ]] && rm -f "$package_path"
-
     print_step_prefix "Create package"
 
-    # Create temporary directory for package
-    local temp_dir
-    temp_dir=$(mktemp -d)
+    if ! source_temp_dir=$(mktemp -d); then
+        echo -e "${RED}ERROR${NC} (failed to create temporary directory)"
+        return 1
+    fi
+    if ! archive_temp_dir=$(mktemp -d "$package_dir/.package.XXXXXX"); then
+        rm -rf "$source_temp_dir"
+        echo -e "${RED}ERROR${NC} (failed to create package staging directory)"
+        return 1
+    fi
+    temp_package_path="$archive_temp_dir/$package_name"
 
+    if ! copy_package_files "$source_temp_dir"; then
+        rm -rf "$source_temp_dir" "$archive_temp_dir"
+        echo -e "${RED}ERROR${NC} (failed to copy package files)"
+        return 1
+    fi
 
-    # Copy files to temp directory
+    if ! (cd "$source_temp_dir" && zip -r -q "$temp_package_path" .); then
+        rm -rf "$source_temp_dir" "$archive_temp_dir"
+        echo -e "${RED}ERROR${NC} (zip failed)"
+        return 1
+    fi
+
+    if ! mv -f "$temp_package_path" "$package_path"; then
+        rm -rf "$source_temp_dir" "$archive_temp_dir"
+        echo -e "${RED}ERROR${NC} (failed to install package)"
+        return 1
+    fi
+
+    rm -rf "$source_temp_dir" "$archive_temp_dir"
+    echo -e "${GREEN}OK${NC}"
+}
+
+copy_package_files() {
+    local temp_dir="$1"
+    local file
+    local filepath
+    local target_dir
+
     while IFS= read -r file; do
-        local filepath="$ROOT_DIR/$file"
+        filepath="$ROOT_DIR/$file"
         [[ ! -f "$filepath" ]] && continue
 
-        local target_dir
-         target_dir="$temp_dir/$(dirname "$file")"
-
-        mkdir -p "$target_dir"
-        cp "$filepath" "$temp_dir/$file"
-    done < <(get_files "$ROOT_DIR" "${PACKAGE_EXCLUDES[@]}")
-
-    # Create zip
-    (cd "$temp_dir" && zip -r -q "$package_path" . 2>/dev/null)
-    local result=$?
-
-    # Cleanup
-    rm -rf "$temp_dir"
-
-    [[ $result -eq 0 ]] && echo -e "${GREEN}OK${NC}" || echo -e "${RED}ERROR${NC}"
-    return $result
+        target_dir="$temp_dir/$(dirname "$file")"
+        mkdir -p "$target_dir" || return 1
+        cp -p "$filepath" "$temp_dir/$file" || return 1
+    done < <(get_files "$ROOT_DIR" "${COMMON_EXCLUDES[@]}" "${PACKAGE_EXTRA_EXCLUDES[@]}")
 }
 
 # Package release
@@ -578,16 +722,9 @@ action_reset_since() {
         [[ ! -f "$filepath" ]] && continue
         LC_ALL=C grep -Iq . "$filepath" || continue
 
-        local original
-        original=$(cat "$filepath")
-        local replace
-        replace=$(echo "$original" | sed -E "s/@since([[:space:]]*).*/@since\1__DEPLOY_VERSION__/g")
-
-        if [[ "$original" != "$replace" ]]; then
-            echo "$replace" > "$filepath"
-            ((count++))
-        fi
-    done < <(get_files "$ROOT_DIR" "${FILES_EXCLUDES[@]}")
+        transform_file "$filepath" since
+        [[ "$FILE_CHANGED" == true ]] && ((count += 1))
+    done < <(get_files "$ROOT_DIR" "${COMMON_EXCLUDES[@]}")
 
     [[ $count -gt 0 ]] && echo -e "${GREEN}OK${NC} ($count files)" || echo -e "${GREEN}OK${NC}"
 }
@@ -607,16 +744,8 @@ action_prepare_dev() {
             [[ ! -f "$file" ]] && continue
             [[ "$(basename "$file")" == "profiles_settings.xml" ]] && continue
 
-            local original
-            original=$(cat "$file")
-            local replace="$original"
-            replace=$(echo "$replace" | sed -E "s/@version([[:space:]]*).*&#10/@version\1__DEPLOY_VERSION__\&#10/g")
-            replace=$(echo "$replace" | sed -E "s/@date([[:space:]]*).*&#10/@date\1$DATE\&#10;/g")
-
-            if [[ "$original" != "$replace" ]]; then
-                echo "$replace" > "$file"
-                ((count++))
-            fi
+            transform_file "$file" copyright "$DATE"
+            [[ "$FILE_CHANGED" == true ]] && ((count += 1))
         done
         [[ $count -gt 0 ]] && echo -e "${GREEN}OK${NC} ($count files)" || echo -e "${GREEN}OK${NC}"
     else
@@ -633,22 +762,20 @@ action_normalize_lang_file_names() {
 
     while IFS= read -r file; do
         [[ "$file" == *.ini ]] || continue
-        local rel_path="${file#$ROOT_DIR/}"
-
-        # Skip excluded paths
-        should_exclude "$rel_path" "${PACKAGE_EXCLUDES[@]}" && continue
-
         # Match files like xx-XX.name.ini or xx-XX.name.sys.ini
-        if [[ "$file" =~ /([a-z]{2}-[A-Z]{2})\.([a-z0-9_]+(\.sys)?)\.ini$ ]]; then
-            local new_name="${BASH_REMATCH[2]}.ini"
+        if [[ "$file" =~ (^|/)([a-z]{2}-[A-Z]{2})\.([a-z0-9_]+(\.sys)?)\.ini$ ]]; then
+            local new_name="${BASH_REMATCH[3]}.ini"
+            local new_rel_path
+            local source_path="$ROOT_DIR/$file"
             local new_path
-            new_path="$(dirname "$file")/$new_name"
+            new_rel_path="$(dirname "$file")/$new_name"
+            new_path="$ROOT_DIR/$new_rel_path"
 
             if [[ ! -f "$new_path" ]]; then
                 # Try git mv first
-                if git mv "$file" "$new_path" 2>/dev/null; then
+                if git -C "$ROOT_DIR" mv -- "$file" "$new_rel_path" 2>/dev/null; then
                     local status
-                    status=$(git status --short "$new_path" 2>/dev/null || echo "")
+                    status=$(git -C "$ROOT_DIR" status --short -- "$new_rel_path" 2>/dev/null || echo "")
                     if [[ "$status" =~ ^R ]]; then
                         renamed+=("$new_name")
                     else
@@ -656,11 +783,11 @@ action_normalize_lang_file_names() {
                     fi
                 else
                     # Fallback to standard rename
-                    mv "$file" "$new_path" 2>/dev/null && renamed+=("$new_name (no git)")
+                    mv "$source_path" "$new_path" 2>/dev/null && renamed+=("$new_name (no git)")
                 fi
             fi
         fi
-    done < <(get_files "$ROOT_DIR" "${PACKAGE_EXCLUDES[@]}")
+    done < <(get_files "$ROOT_DIR" "${COMMON_EXCLUDES[@]}" "${PACKAGE_EXTRA_EXCLUDES[@]}")
 
     [[ ${#renamed[@]} -gt 0 ]] && echo -e "${GREEN}OK${NC}" || echo -e "${GREEN}OK${NC}"
     echo
@@ -686,10 +813,10 @@ action_package_dev() {
 main() {
     parse_args "$@"
 
-    # Validate required parameters for most actions
-    if [[ "$ACTION" != "normalizeLangFileNames" ]] && [[ -z "$NAME" || -z "$VERSION" ]]; then
+    # The explicitly provided env file must define both values for every action.
+    if [[ -z "$NAME" || -z "$VERSION" ]]; then
         echo "Error: Project name and version are required"
-        echo "Either provide --name and --version, or ensure they are set in .env file"
+        echo "Provide --name and --version, or define them in the env file"
         exit 1
     fi
 
