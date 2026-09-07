@@ -19,10 +19,6 @@ PROJECT_NPM_DIR="build"
 
 # Exclusions shared by file processing and package creation
 COMMON_EXCLUDES=(
-    ".idea"
-    ".git"
-    ".packages"
-    ".build"
     "node_modules"
     "vendor"
     ".gitignore"
@@ -350,7 +346,8 @@ get_files() {
     local excludes=("$@")
     local files=()
     local prune_dirs=()
-    local find_args=("$dir")
+    # Prune every hidden directory below the project root, at any depth.
+    local find_args=("$dir" "(" "-type" "d" "!" "-path" "$dir" "-name" ".*" "-prune" ")" "-o")
     local i
 
     while IFS= read -r prune_dir; do

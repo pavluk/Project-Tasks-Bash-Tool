@@ -77,6 +77,11 @@ If `PROJECT_NPM` is set:
 
 ## File Processing and Packaging
 
+All directories whose names start with a dot are skipped at every depth during
+general file processing and packaging. The explicit PhpStorm integration in
+`prepareDev` still updates XML copyright templates in `.idea/copyright`, excluding
+`profiles_settings.xml`. `.packages` remains the output directory for generated archives.
+
 The common exclusion list is shared by replacements and package creation. Packaging
 adds `build` to that list, so generated build sources can be processed before release
 but are not included in the ZIP archive.
